@@ -1,0 +1,207 @@
+# giudice.yml — G0 di DIADE fuori dal Mac: il giudice ufficiale di Lean (`lake comparator` della v4.35, cinque kernel),
+# su tre macchine che nascono e muoiono con la corsa. Mente, g1458, dopo la Sorveglianza 101ª §1: la stesura del g1457
+# rifaceva solo il filtro di casa, e un SI del filtro non è un SI del giudice (una prova che cambia l'enunciato
+# tenendo il nome passa il filtro). A casa `passa` = filtro E comparator (`metro/scala/corri.py`, `giudica.py`).
+#
+#   1. enunciato — una VM costruisce l'enunciato (col sorry) ed esporta le sue costanti con lean4export (v4.33.1).
+#      Nessun byte della prova la raggiunge. Lo sha256 dell'export esce come output del lavoro.
+#   2. prova — un'altra VM, senza credenziali e coi soli permessi di lettura, fa il filtro di casa (il file più
+#      `#print axioms`, sotto /usr/bin/time -v: tempo e memoria di picco), poi costruisce ed esporta la prova.
+#      È codice non fidato: su quella VM può fare ciò che vuole, e di lì esce solo un file di dati.
+#   3. giudizio — una terza VM, che non esegue niente della prova, scarica i due export, controlla che l'enunciato sia
+#      quello dato dal lavoro 1 (sha), e fa girare `lake comparator` con cinque kernel: Lean, leanchecker-paranoid,
+#      nanoda, con-leche, con-ron (lean4lean no: sulle esportazioni v4.33.1 cade anche sulle prove vere, banco g1449).
+#
+# Il verdetto è la riga `VERDETTO_G0:` nel log del lavoro «giudizio», e solo quella. Le cifre del filtro (tempo,
+# memoria) vengono dalla VM non fidata: valgono per chi si fida di chi ha scritto la prova, non contro un avversario.
+# Il tempo è di un'altra CPU: la regola v1 di casa (300 s sul Mac) NON si applica qui; la applica casa, con la regola
+# scritta prima nel varco. Solo file della metà visibile della scala: mai nulla di `cieca/`.
+name: giudice
+on:
+  workflow_dispatch:
+    inputs:
+      enunciato:
+        description: "il file-enunciato col sorry, dentro il repo (es. enunciati/L1-v09.lean)"
+        required: true
+      prova:
+        description: "il file-prova da giudicare, dentro il repo (es. prove/r3/L1-v09__a2.lean)"
+        required: true
+      bersaglio:
+        description: "il nome pieno del teorema (es. mathd_numbertheory_451)"
+        required: true
+permissions:
+  contents: read
+env:
+  E: ${{ github.event.inputs.enunciato }}
+  P: ${{ github.event.inputs.prova }}
+  B: ${{ github.event.inputs.bersaglio }}
+  # come casa (`motore/giudice/banco.py`: BUILTIN + nomi + ASSIOMI + PRIMITIVI)
+  PRIMA: "Quot Quot.mk Quot.lift Quot.ind"
+  DOPO: >-
+    propext Quot.sound Classical.choice Nat.add Nat.sub Nat.mul Nat.pow Nat.gcd Nat.div Nat.mod Nat.beq Nat.ble
+    Nat.land Nat.lor Nat.xor Nat.shiftLeft Nat.shiftRight String.ofList Char.ofNat List eagerReduce Nat String
+    String.mk Char optParam autoParam semiOutParam outParam
+jobs:
+  enunciato:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      sha: ${{ steps.esporta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: elan, Mathlib dagli olean, lean4export (v4.33.1)
+        run: bash .github/prepara.sh
+      - name: costruisce ed esporta l'enunciato (nessuna prova esiste su questa macchina)
+        id: esporta
+        run: |
+          mkdir -p Giudizio && cp "$E" Giudizio/Challenge.lean
+          lake build Giudizio.Challenge
+          lake env "$RUNNER_TEMP/lean4export-bin" Giudizio.Challenge -- $PRIMA "$B" $DOPO > challenge.ndjson
+          s=$(sha256sum challenge.ndjson | cut -d' ' -f1)
+          echo "SHA_EXPORT_ENUNCIATO: $s ($(wc -c < challenge.ndjson) byte) · sorgente $(sha256sum "$E" | cut -d' ' -f1)"
+          echo "sha=$s" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: enunciato
+          path: challenge.ndjson
+
+  prova:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: elan, Mathlib dagli olean, lean4export (v4.33.1)
+        run: bash .github/prepara.sh
+      - name: il filtro di casa (il file + `#print axioms`), tempo e memoria
+        run: |
+          { cat "$P"; printf '\n\n#print axioms %s\n' "$B"; } > filtro.lean
+          set +e
+          /usr/bin/time -v lake env lean filtro.lean > filtro_uscita.txt 2> filtro_tempo.txt; rc=$?
+          set -e
+          head -c 20000 filtro_uscita.txt
+          python3 - "$rc" "$B" <<'PY' | tee filtro_esito.txt
+          import re, sys
+          rc, b = int(sys.argv[1]), sys.argv[2]
+          out, t = open("filtro_uscita.txt").read(), open("filtro_tempo.txt").read()
+          m = re.search(r"Maximum resident set size \(kbytes\): (\d+)", t)
+          gib = int(m.group(1)) / 1024 / 1024 if m else -1
+          s = 0.0
+          el = re.search(r"Elapsed \(wall clock\) time .*?: ([\d:.]+)", t)
+          for x in (el.group(1).split(":") if el else []):
+              s = s * 60 + float(x)
+          OK = {"propext", "Classical.choice", "Quot.sound"}
+          if [l for l in out.splitlines() if re.search(r":\d+:\d+: error", l)]:
+              k = "RIFIUTA (errore)"
+          else:
+              a = re.search("'" + re.escape(b) + r"' depends on axioms: \[(.*?)\]", out, re.S)
+              if a:
+                  ax = {x.strip() for x in a.group(1).replace("\n", " ").split(",")}
+                  k = "ACCETTA" if ax <= OK else "RIFIUTA (assiomi fuori: " + ", ".join(sorted(ax - OK)) + ")"
+              elif f"'{b}' does not depend on any axioms" in out:
+                  k = "ACCETTA"
+              else:
+                  k = "RIFIUTA (#print axioms del bersaglio non ha risposto)"
+          print(f"FILTRO: {k}")
+          print(f"FILTRO_SECONDI: {s:.1f} · FILTRO_MEMORIA_GIB: {gib:.2f} · LEAN_RC: {rc}")
+          PY
+      - name: costruisce ed esporta la prova (codice non fidato)
+        run: |
+          mkdir -p Giudizio && cp "$P" Giudizio/Solution.lean
+          set +e
+          lake build Giudizio.Solution > build.txt 2>&1; brc=$?
+          erc=-1
+          if [ $brc -eq 0 ]; then
+            lake env "$RUNNER_TEMP/lean4export-bin" Giudizio.Solution -- $PRIMA "$B" $DOPO > solution.ndjson; erc=$?
+          fi
+          set -e
+          tail -c 4000 build.txt
+          echo "BUILD_RC: $brc · EXPORT_RC: $erc" | tee -a filtro_esito.txt
+          if [ $brc -ne 0 ] || [ $erc -ne 0 ]; then : > solution.ndjson; fi
+          touch solution.ndjson
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prova
+          path: |
+            solution.ndjson
+            filtro_esito.txt
+            filtro_tempo.txt
+
+  giudizio:
+    needs: [enunciato, prova]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: sorgenti
+      - uses: actions/download-artifact@v4
+        with:
+          name: enunciato
+          path: dati/enunciato
+      - uses: actions/download-artifact@v4
+        with:
+          name: prova
+          path: dati/prova
+      - name: la toolchain v4.35.0-rc4 (lake comparator e i kernel) e bubblewrap per la sandbox
+        run: |
+          curl -sSfL https://github.com/leanprover/elan/releases/latest/download/elan-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          ./elan-init -y --default-toolchain leanprover/lean4:v4.35.0-rc4 >/dev/null
+          L="$HOME/.elan/toolchains/leanprover--lean4---v4.35.0-rc4/bin"
+          ls "$L"
+          for k in lake leanchecker-paranoid nanoda_bin con-leche con-ron; do test -x "$L/$k" || { echo "manca $k"; exit 2; }; done
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap >/dev/null
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: giudizio
+        run: |
+          L="$HOME/.elan/toolchains/leanprover--lean4---v4.35.0-rc4/bin"
+          C="$PWD/dati/enunciato/challenge.ndjson"; S="$PWD/dati/prova/solution.ndjson"
+          sc=$(sha256sum "$C" | cut -d' ' -f1)
+          echo "SHA_ENUNCIATO_SORGENTE: $(sha256sum "sorgenti/$E" | cut -d' ' -f1) ($E)"
+          echo "SHA_PROVA_SORGENTE: $(sha256sum "sorgenti/$P" | cut -d' ' -f1) ($P)"
+          echo "SHA_EXPORT_ENUNCIATO: $sc (dal lavoro enunciato: ${{ needs.enunciato.outputs.sha }})"
+          echo "== dal lavoro prova (VM non fidata):"; cat dati/prova/filtro_esito.txt
+          mkdir giudice && cd giudice
+          python3 - "$B" "$L" <<'PY'
+          import json, sys
+          b, L = sys.argv[1], sys.argv[2]
+          json.dump({"challenge_module": "Challenge", "solution_module": "Solution", "theorem_names": [b],
+                     "permitted_axioms": ["propext", "Quot.sound", "Classical.choice"],
+                     "external_kernels": {"Lean paranoid": [L + "/leanchecker-paranoid", "--silent", "--from-export"],
+                                          "nanoda": [L + "/nanoda_bin"], "con-leche": [L + "/con-leche"],
+                                          "con-ron": [L + "/con-ron"]}}, open("comparator.json", "w"))
+          PY
+          if [ "$sc" != "${{ needs.enunciato.outputs.sha }}" ]; then
+            echo "VERDETTO_G0: NON PARTE (l'export dell'enunciato non è quello che il lavoro enunciato ha dato)"; exit 1
+          fi
+          if [ ! -s "$S" ]; then
+            echo "VERDETTO_G0: RIFIUTA (la prova non si costruisce o non si esporta: vedi il lavoro prova)"; exit 0
+          fi
+          export PATH="$L:/usr/bin:/bin:/usr/sbin:/sbin"
+          set +e
+          lake comparator --config comparator.json --challenge-from-export "$C" --solution-from-export "$S" > uscita.txt 2>&1; rc=$?
+          sb=bwrap
+          if [ $rc -ne 0 ] && [ $rc -ne 1 ] && grep -qiE "bwrap|bubblewrap|sandbox|namespace" uscita.txt; then
+            echo "== la sandbox non parte su questa VM:"; tail -20 uscita.txt
+            sb="nessuna (VM fresca che riceve solo dati)"
+            lake comparator --config comparator.json --challenge-from-export "$C" --solution-from-export "$S" \
+              --inadvisably-no-sandbox > uscita.txt 2>&1; rc=$?
+          fi
+          set -e
+          tail -c 20000 uscita.txt
+          grep -E "kernel (accepts|rejected)|Error while interacting" uscita.txt || true
+          if [ $rc -eq 0 ] && grep -q "Your solution is okay!" uscita.txt; then v=ACCETTA
+          elif [ $rc -eq 1 ]; then v=RIFIUTA
+          else v="NON PARTE (exit $rc)"; fi
+          echo "SANDBOX: $sb"
+          echo "VERDETTO_G0: $v"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verdetto
+          path: giudice/
