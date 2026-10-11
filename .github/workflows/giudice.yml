@@ -151,7 +151,8 @@ jobs:
       - name: la toolchain v4.35.0-rc4 (lake comparator e i kernel) e bubblewrap per la sandbox
         run: |
           curl -sSfL https://github.com/leanprover/elan/releases/latest/download/elan-x86_64-unknown-linux-gnu.tar.gz | tar xz
-          ./elan-init -y --default-toolchain leanprover/lean4:v4.35.0-rc4 >/dev/null
+          ./elan-init -y --default-toolchain none >/dev/null
+          "$HOME/.elan/bin/elan" toolchain install leanprover/lean4:v4.35.0-rc4  # elan nuovo installa al primo uso: qui serve subito
           L="$HOME/.elan/toolchains/leanprover--lean4---v4.35.0-rc4/bin"
           ls "$L"
           for k in lake leanchecker-paranoid nanoda_bin con-leche con-ron; do test -x "$L/$k" || { echo "manca $k"; exit 2; }; done
