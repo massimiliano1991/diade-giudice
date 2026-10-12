@@ -4,6 +4,7 @@
 # e lean4export allo stesso commit di casa, costruito sulla v4.33.1 (un esportatore legge solo gli olean della sua versione).
 # Si esegue dalla radice del repo, PRIMA che un qualunque byte della prova entri nel progetto.
 set -euo pipefail
+bash .github/ingresso.sh
 curl -sSfL https://github.com/leanprover/elan/releases/latest/download/elan-x86_64-unknown-linux-gnu.tar.gz | tar xz
 ./elan-init -y --default-toolchain none >/dev/null
 rm -f elan-init

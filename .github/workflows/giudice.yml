@@ -5,15 +5,21 @@
 #
 #   1. enunciato — una VM costruisce l'enunciato (col sorry) ed esporta le sue costanti con lean4export (v4.33.1).
 #      Nessun byte della prova la raggiunge. Lo sha256 dell'export esce come output del lavoro.
-#   2. prova — un'altra VM, senza credenziali e coi soli permessi di lettura, fa il filtro di casa (il file più
-#      `#print axioms`, sotto /usr/bin/time -v: tempo e memoria di picco), poi costruisce ed esporta la prova.
-#      È codice non fidato: su quella VM può fare ciò che vuole, e di lì esce solo un file di dati.
+#   2. prova — un'altra VM, senza credenziali e coi soli permessi di lettura. Il codice della prova gira SOLO dentro
+#      bubblewrap (`.github/sandbox.sh`, g1460): senza rete, senza variabili d'ambiente, senza sudo, senza la home e i
+#      file di comando del runner. Fa il filtro di casa (il file più `#print axioms`; tempo e memoria li misura il passo
+#      fidato, fuori dalla sandbox), poi costruisce ed esporta la prova. Ciò che il passo fidato tiene sta in
+#      $RUNNER_TEMP/fidato, che la sandbox non vede; di lì esce un file di dati.
 #   3. giudizio — una terza VM, che non esegue niente della prova, scarica i due export, controlla che l'enunciato sia
 #      quello dato dal lavoro 1 (sha), e fa girare `lake comparator` con cinque kernel: Lean, leanchecker-paranoid,
 #      nanoda, con-leche, con-ron (lean4lean no: sulle esportazioni v4.33.1 cade anche sulle prove vere, banco g1449).
+#      Se la sandbox del comparator non parte, non giudica (prima del g1460 ripiegava senza sandbox).
 #
-# Il verdetto è la riga `VERDETTO_G0:` nel log del lavoro «giudizio», e solo quella. Le cifre del filtro (tempo,
-# memoria) vengono dalla VM non fidata: valgono per chi si fida di chi ha scritto la prova, non contro un avversario.
+# Il verdetto lo scrive solo il passo fidato del lavoro «giudizio» (g1460, Sorveglianza 103ª §1): nel riassunto del
+# lavoro, nell'output `verdetto` e come ultima riga del suo log, `VERDETTO_G0: …`. Ogni byte che viene dalla prova o
+# dal comparator si stampa con `.github/pulisci.py` (ogni carattere di controllo o di formato diventa ⟨U+XXXX⟩, ogni
+# riga rientrata) fra `::stop-commands::` e un gettone casuale. Rientrare non bastava: il runner divide le righe anche
+# su un \r da solo, e così una prova rimetteva `VERDETTO_G0: ACCETTA` a inizio riga.
 # Il tempo è di un'altra CPU: la regola v1 di casa (300 s sul Mac) NON si applica qui; la applica casa, con la regola
 # scritta prima nel varco. Solo file della metà visibile della scala: mai nulla di `cieca/`.
 name: giudice
@@ -76,17 +82,32 @@ jobs:
           persist-credentials: false
       - name: elan, Mathlib dagli olean, lean4export (v4.33.1)
         run: bash .github/prepara.sh
-      - name: il filtro di casa (il file + `#print axioms`), tempo e memoria
+      - name: la sandbox e la cartella fidata, prima che un byte della prova giri
         run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap >/dev/null
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          F="$RUNNER_TEMP/fidato"; mkdir -p "$F"
+          cp .github/pulisci.py .github/sandbox.sh "$F/"
+          cp "$RUNNER_TEMP/lean4export-bin" "$F/lean4export"
+          bash "$F/sandbox.sh" lake --version
+          bash "$F/sandbox.sh" sh -c 'sudo -n true' && { echo "la sandbox lascia sudo: non parto"; exit 1; }
+          echo "SANDBOX_PROVA: bwrap"
+      - name: il filtro di casa (il file + `#print axioms`) nella sandbox; tempo e memoria misurati da fuori
+        run: |
+          F="$RUNNER_TEMP/fidato"
           { cat "$P"; printf '\n\n#print axioms %s\n' "$B"; } > filtro.lean
           set +e
-          /usr/bin/time -v lake env lean filtro.lean > filtro_uscita.txt 2> filtro_tempo.txt; rc=$?
+          /usr/bin/time -v -o "$F/filtro_tempo.txt" bash "$F/sandbox.sh" lake env lean filtro.lean > "$F/filtro_uscita.txt" 2>&1; rc=$?
           set -e
-          head -c 20000 filtro_uscita.txt | sed 's/^/  │ /'  # ciò che stampa la prova non comincia mai come una riga del giudice
-          python3 - "$rc" "$B" <<'PY' | tee filtro_esito.txt
+          tok=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+          echo "== ciò che la prova ha stampato (non fidato: caratteri di controllo resi visibili, righe rientrate)"
+          echo "::stop-commands::$tok"
+          python3 "$F/pulisci.py" +20000 < "$F/filtro_uscita.txt"
+          echo "::$tok::"
+          python3 - "$rc" "$B" "$F" <<'PY' | tee "$F/filtro_esito.txt"
           import re, sys
-          rc, b = int(sys.argv[1]), sys.argv[2]
-          out, t = open("filtro_uscita.txt").read(), open("filtro_tempo.txt").read()
+          rc, b, F = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+          out, t = open(F + "/filtro_uscita.txt", errors="replace").read(), open(F + "/filtro_tempo.txt").read()
           m = re.search(r"Maximum resident set size \(kbytes\): (\d+)", t)
           gib = int(m.group(1)) / 1024 / 1024 if m else -1
           s = 0.0
@@ -101,7 +122,8 @@ jobs:
               k = f"NON DECIDE (lean rc={rc} senza righe di errore)"
           elif ass:  # l'ultima risposta: `#print axioms` è l'ultimo comando del file, e la prova può stampare prima
               ax = {x.strip() for x in ass[-1].replace("\n", " ").split(",")}
-              k = "ACCETTA" if ax <= OK else "RIFIUTA (assiomi fuori: " + ", ".join(sorted(ax - OK)) + ")"
+              fuori = sorted(re.sub(r"[^\w.'«»]", "?", a) for a in ax - OK)  # nomi scritti dalla prova: niente controlli
+              k = "ACCETTA" if ax <= OK else "RIFIUTA (assiomi fuori: " + ", ".join(fuori) + ")"
           elif f"'{b}' does not depend on any axioms" in out:
               k = "ACCETTA"
           else:
@@ -109,36 +131,44 @@ jobs:
           print(f"FILTRO: {k}")
           print(f"FILTRO_SECONDI: {s:.1f} · FILTRO_MEMORIA_GIB: {gib:.2f} · LEAN_RC: {rc}")
           PY
-      - name: costruisce ed esporta la prova (codice non fidato)
+      - name: costruisce ed esporta la prova (nella sandbox)
         run: |
+          F="$RUNNER_TEMP/fidato"
           mkdir -p Giudizio && cp "$P" Giudizio/Solution.lean
           set +e
-          lake build Giudizio.Solution > build.txt 2>&1; brc=$?
+          bash "$F/sandbox.sh" lake build Giudizio.Solution > "$F/build.txt" 2>&1; brc=$?
           erc=-1
           if [ $brc -eq 0 ]; then
-            lake env "$RUNNER_TEMP/lean4export-bin" Giudizio.Solution -- $PRIMA "$B" $DOPO > solution.ndjson; erc=$?
+            bash "$F/sandbox.sh" lake env /opt/lean4export Giudizio.Solution -- $PRIMA "$B" $DOPO > "$F/solution.ndjson" 2> "$F/export_err.txt"; erc=$?
           fi
           set -e
-          tail -c 4000 build.txt | sed 's/^/  │ /'
-          echo "BUILD_RC: $brc · EXPORT_RC: $erc" | tee -a filtro_esito.txt
+          tok=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+          echo "== la build (non fidata: caratteri di controllo resi visibili, righe rientrate)"
+          echo "::stop-commands::$tok"
+          python3 "$F/pulisci.py" -4000 < "$F/build.txt"
+          [ -s "$F/export_err.txt" ] && python3 "$F/pulisci.py" -2000 < "$F/export_err.txt"
+          echo "::$tok::"
+          echo "BUILD_RC: $brc · EXPORT_RC: $erc" | tee -a "$F/filtro_esito.txt"
           if [ $brc -ge 128 ] || [ $erc -ge 128 ]; then
-            echo "PROVA_GUASTO: build o export uccisi da un segnale (rc $brc / $erc): non è un rifiuto" | tee -a filtro_esito.txt
+            echo "PROVA_GUASTO: build o export uccisi da un segnale (rc $brc / $erc): non è un rifiuto" | tee -a "$F/filtro_esito.txt"
           fi
-          if [ $brc -ne 0 ] || [ $erc -ne 0 ]; then : > solution.ndjson; fi
-          touch solution.ndjson
+          if [ $brc -ne 0 ] || [ $erc -ne 0 ]; then : > "$F/solution.ndjson"; fi
+          touch "$F/solution.ndjson"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: prova
           path: |
-            solution.ndjson
-            filtro_esito.txt
-            filtro_tempo.txt
+            ${{ runner.temp }}/fidato/solution.ndjson
+            ${{ runner.temp }}/fidato/filtro_esito.txt
+            ${{ runner.temp }}/fidato/filtro_tempo.txt
 
   giudizio:
     needs: [enunciato, prova]
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    outputs:
+      verdetto: ${{ steps.giudizio.outputs.verdetto }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -163,15 +193,38 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap >/dev/null
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: giudizio
+        id: giudizio
         run: |
+          bash sorgenti/.github/ingresso.sh
           L="$HOME/.elan/toolchains/leanprover--lean4---v4.35.0-rc4/bin"
+          F="$RUNNER_TEMP/fidato"; mkdir -p "$F"; cp sorgenti/.github/pulisci.py "$F/"
           C="$PWD/dati/enunciato/challenge.ndjson"; S="$PWD/dati/prova/solution.ndjson"
           sc=$(sha256sum "$C" | cut -d' ' -f1)
-          echo "SHA_ENUNCIATO_SORGENTE: $(sha256sum "sorgenti/$E" | cut -d' ' -f1) ($E)"
-          echo "SHA_PROVA_SORGENTE: $(sha256sum "sorgenti/$P" | cut -d' ' -f1) ($P)"
+          se=$(sha256sum "sorgenti/$E" | cut -d' ' -f1); sp=$(sha256sum "sorgenti/$P" | cut -d' ' -f1)
+          tok=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+          esito() {  # il verdetto: lo scrive solo questo passo, nel riassunto, nell'output e come ultima riga del log
+            echo "verdetto=$1" >> "$GITHUB_OUTPUT"
+            { echo "## VERDETTO_G0: $1"
+              echo
+              echo "Scritto dal passo fidato del lavoro \`giudizio\`, che non esegue niente della prova. Il lavoro \`prova\` esegue il codice della prova in una sandbox: niente di ciò che compare lì è un verdetto."
+              echo
+              echo "| | |"
+              echo "|---|---|"
+              echo "| enunciato | \`$E\` · sha256 \`$se\` |"
+              echo "| prova | \`$P\` · sha256 \`$sp\` |"
+              echo "| bersaglio | \`$B\` |"
+              echo "| export dell'enunciato | sha256 \`$sc\` |"
+              echo "| commit del giudice | \`$GITHUB_SHA\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "VERDETTO_G0: $1"
+          }
+          echo "SHA_ENUNCIATO_SORGENTE: $se ($E)"
+          echo "SHA_PROVA_SORGENTE: $sp ($P)"
           echo "SHA_EXPORT_ENUNCIATO: $sc (dal lavoro enunciato: ${{ needs.enunciato.outputs.sha }})"
-          echo "== dal lavoro prova (VM non fidata; rientrato, così nessuna sua riga può sembrare un verdetto):"
-          sed 's/^/  │ /' dati/prova/filtro_esito.txt
+          echo "== dal lavoro prova (scritto dal suo passo fidato; i nomi che contiene vengono dalla prova):"
+          echo "::stop-commands::$tok"
+          python3 "$F/pulisci.py" < dati/prova/filtro_esito.txt
+          echo "::$tok::"
           mkdir giudice && cd giudice
           python3 - "$B" "$L" <<'PY'
           import json, sys
@@ -183,34 +236,30 @@ jobs:
                                           "con-ron": [L + "/con-ron"]}}, open("comparator.json", "w"))
           PY
           if [ "$sc" != "${{ needs.enunciato.outputs.sha }}" ]; then
-            echo "VERDETTO_G0: NON PARTE (l'export dell'enunciato non è quello che il lavoro enunciato ha dato)"; exit 1
+            esito "NON PARTE (l'export dell'enunciato non è quello che il lavoro enunciato ha dato)"; exit 1
           fi
-          if [ ! -s "$S" ] && grep -q "^PROVA_GUASTO:" dati/prova/filtro_esito.txt; then
-            # la VM non fidata può scriverlo anche da sé: sposta solo da RIFIUTA a NON DECIDE, mai verso ACCETTA
-            echo "VERDETTO_G0: NON DECIDE (la build o l'export della prova sono stati uccisi: vedi il lavoro prova)"; exit 0
+          if [ ! -s "$S" ] && grep -q "^PROVA_GUASTO:" ../dati/prova/filtro_esito.txt; then
+            esito "NON DECIDE (la build o l'export della prova sono stati uccisi: vedi il lavoro prova)"; exit 0
           fi
           if [ ! -s "$S" ]; then
-            echo "VERDETTO_G0: RIFIUTA (la prova non si costruisce o non si esporta: vedi il lavoro prova)"; exit 0
+            esito "RIFIUTA (la prova non si costruisce o non si esporta: vedi il lavoro prova)"; exit 0
           fi
           export PATH="$L:/usr/bin:/bin:/usr/sbin:/sbin"
           set +e
           lake comparator --config comparator.json --challenge-from-export "$C" --solution-from-export "$S" > uscita.txt 2>&1; rc=$?
-          sb=bwrap
-          if [ $rc -ne 0 ] && [ $rc -ne 1 ] && grep -qiE "bwrap|bubblewrap|sandbox|namespace" uscita.txt; then
-            echo "== la sandbox non parte su questa VM:"; tail -20 uscita.txt | sed 's/^/  │ /'
-            sb="nessuna (VM fresca che riceve solo dati)"
-            lake comparator --config comparator.json --challenge-from-export "$C" --solution-from-export "$S" \
-              --inadvisably-no-sandbox > uscita.txt 2>&1; rc=$?
-          fi
           set -e
-          tail -c 20000 uscita.txt | sed 's/^/  │ /'
-          grep -E "kernel (accepts|rejected)|Error while interacting" uscita.txt | sed 's/^/  │ /' || true
+          echo "== il comparator (i nomi e i messaggi sui dati della prova non sono fidati: resi visibili, righe rientrate)"
+          echo "::stop-commands::$tok"
+          python3 "$F/pulisci.py" -20000 < uscita.txt
+          echo "::$tok::"
           if [ $rc -eq 0 ] && grep -q "Your solution is okay!" uscita.txt; then v=ACCETTA
+          elif [ $rc -ne 1 ] && grep -qiE "bwrap|bubblewrap|sandbox|namespace" uscita.txt; then
+            v="NON PARTE (la sandbox del comparator non parte su questa VM: senza sandbox non giudico)"
           elif [ $rc -eq 1 ] && grep -qE "do not match|Illegal axiom|rejected" uscita.txt; then v=RIFIUTA
           elif [ $rc -eq 1 ]; then v="NON DECIDE (exit 1 senza un rifiuto riconosciuto: un kernel caduto non è un rifiuto)"
           else v="NON PARTE (exit $rc)"; fi
-          echo "SANDBOX: $sb"
-          echo "VERDETTO_G0: $v"
+          echo "SANDBOX: bwrap"
+          esito "$v"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
