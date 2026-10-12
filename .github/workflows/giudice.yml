@@ -4,12 +4,12 @@
 # tenendo il nome passa il filtro). A casa `passa` = filtro E comparator (`metro/scala/corri.py`, `giudica.py`).
 #
 #   1. enunciato — una VM costruisce l'enunciato (col sorry) ed esporta le sue costanti con lean4export (v4.33.1).
-#      Nessun byte della prova la raggiunge. Lo sha256 dell'export esce come output del lavoro.
+#      Questo lavoro non legge né costruisce la prova (il checkout clona tutto il repo; lui copia solo l'enunciato). Lo sha256 dell'export esce come output del lavoro.
 #   2. prova — un'altra VM, senza credenziali e coi soli permessi di lettura. Il codice della prova gira SOLO dentro
 #      bubblewrap (`.github/sandbox.sh`, g1460): senza rete, senza variabili d'ambiente, senza sudo, senza la home e i
 #      file di comando del runner. Fa il filtro di casa (il file più `#print axioms`; tempo e memoria li misura il passo
 #      fidato, fuori dalla sandbox), poi costruisce ed esporta la prova. Ciò che il passo fidato tiene sta in
-#      $RUNNER_TEMP/fidato, che la sandbox non vede; di lì esce un file di dati.
+#      $RUNNER_TEMP/fidato, che la sandbox non vede; di lì escono i file di dati (export, esito e tempo del filtro).
 #   3. giudizio — una terza VM, che non esegue niente della prova, scarica i due export, controlla che l'enunciato sia
 #      quello dato dal lavoro 1 (sha), e fa girare `lake comparator` con cinque kernel: Lean, leanchecker-paranoid,
 #      nanoda, con-leche, con-ron (lean4lean no: sulle esportazioni v4.33.1 cade anche sulle prove vere, banco g1449).
