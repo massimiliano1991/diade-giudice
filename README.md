@@ -49,3 +49,11 @@ The comparator says the proof proves *that* statement; whether the statement say
 question.
 
 Material of DIADE (Vera). Proof files are outputs of DIADE's prover, kept here so verdicts can be re-run.
+
+## The v1 curve, checkable here
+
+`curva/v1/` holds the result of the first three runs of DIADE's math ladder (`v1`, runs `r1` to `r3`): the
+visible half with every attempt row, the proof file of every accepted attempt, the statements they prove, and
+the counting rule — so that each accepted proof can be re-judged on this repo's workflow with one button, and
+the figure recomputed from the rows. The blind half appears as counts only; the prover, its prompt and the
+runner stay at home. See `curva/v1/README.md`.
