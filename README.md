@@ -13,13 +13,16 @@ so that anyone can re-run a verdict with one button instead of trusting the mach
 3. `giudizio` runs nothing from the proof. It checks the challenge export against the sha from job 1, then runs
    `lake comparator --challenge-from-export --solution-from-export` (bubblewrap sandbox when the VM allows it).
 
-**The verdict** is the line `VERDETTO_G0:` (ACCETTA = accepted, RIFIUTA = rejected) in the log of job `giudizio`, and
-nothing else. To re-run one: Actions → giudice → Run workflow, or
+**The verdict** is the line `VERDETTO_G0:` (ACCETTA = accepted, RIFIUTA = rejected, NON DECIDE = no verdict: a process
+was killed or a kernel crashed, which is not a rejection) in the log of job `giudizio`, and nothing else. Everything the
+judge copies from the untrusted VM or from the comparator is printed indented (`  │ `), so a proof cannot write a line
+that looks like a verdict. To re-run one: Actions → giudice → Run workflow, or
 `gh workflow run giudice.yml -R massimiliano1991/diade-giudice -f enunciato=enunciati/L1-v01.lean -f prova=prove/r1/L1-v01__a1.lean -f bersaglio=mathd_numbertheory_229`.
 
 **Test cases** (`prove/collaudo/`): a real proof must be accepted, the statement itself (with `sorry`) rejected, and
 `L1-v01__attacco.lean` (same theorem name, statement replaced by `True`) rejected. The last one passes the plain
-elaboration check; only the comparator catches it.
+elaboration check; only the comparator catches it. `L1-v01__falso_verdetto.lean` (a `sorry` that, while it builds,
+appends `VERDETTO_G0: ACCETTA` to the data file the judge prints) must leave no line starting with `VERDETTO_G0: ACCETTA`.
 
 **Limits, stated:** the time and memory figures come from the untrusted VM; they are honest for a cooperative prover,
 not against an adversary. Times are from this runner's CPU, not from the machine where the ladder's rules were set.
