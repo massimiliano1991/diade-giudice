@@ -120,9 +120,10 @@ jobs:
           F="$RUNNER_TEMP/fidato"
           case "$U" in http://*|https://*) ;; *) echo "prova_url non è un URL http(s)"; exit 2;; esac
           case "$U$M$SHA_ATTESO" in *[[:space:][:cntrl:]]*) echo "input con spazi o caratteri di controllo"; exit 2;; esac
+          case "$M" in -*) echo "prova_membro non può cominciare con -"; exit 2;; esac
           D="$RUNNER_TEMP/altrui"; mkdir "$D"
           curl -sSfL --max-filesize 50000000 -o "$D/scaricato" -- "$U"
-          if [ -n "$M" ]; then unzip -p "$D/scaricato" -- "$M" > "$D/prova.lean"; else cp "$D/scaricato" "$D/prova.lean"; fi
+          if [ -n "$M" ]; then unzip -p "$D/scaricato" "$M" > "$D/prova.lean"; else cp "$D/scaricato" "$D/prova.lean"; fi
           test -s "$D/prova.lean" || { echo "il file .lean ottenuto è vuoto"; exit 2; }
           s=$(sha256sum "$D/prova.lean" | cut -d' ' -f1)
           echo "FONTE: $U${M:+ ($M)}"
