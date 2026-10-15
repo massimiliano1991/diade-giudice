@@ -1,0 +1,83 @@
+name: Richiesta di giudizio (G0)
+description: >
+  Chiedi al giudice pubblico di DIADE di verificare una prova Lean 4.
+  La prova gira in sandbox (bubblewrap, senza rete, senza credenziali) su una VM
+  GitHub Actions che nasce e muore con questa corsa. Il verdetto è pubblico.
+title: "[giudizio] "
+labels:
+  - giudizio
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Come funziona
+        Il giudice scarica la tua prova dall'URL che indichi, la fa girare in **sandbox**
+        (bubblewrap — niente rete, niente credenziali, niente sudo), e pubblica il verdetto
+        come commento su questa issue. La prova non viene conservata né ripubblicata.
+
+        Compila tutti i campi obbligatori; il workflow parte automaticamente.
+
+  - type: input
+    id: enunciato
+    attributes:
+      label: enunciato
+      description: >
+        Nome del file-enunciato nel repo (solo il nome, senza «enunciati/»).
+        Esempi: L1-v01.lean, L2-v08.lean
+      placeholder: "L1-v01.lean"
+    validations:
+      required: true
+
+  - type: input
+    id: bersaglio
+    attributes:
+      label: bersaglio
+      description: >
+        Nome completo del teorema da verificare.
+        Esempio: mathd_numbertheory_229
+      placeholder: "mathd_numbertheory_229"
+    validations:
+      required: true
+
+  - type: input
+    id: prova_url
+    attributes:
+      label: prova_url
+      description: >
+        URL della prova: deve essere un link «raw» di GitHub nella forma
+        https://github.com/<utente>/<repo>/raw/<sha40>/<percorso>.(lean|zip)
+        (mai un file del repo del giudice).
+      placeholder: "https://github.com/utente/repo/raw/abc123.../soluzione.lean"
+    validations:
+      required: true
+
+  - type: input
+    id: prova_membro
+    attributes:
+      label: prova_membro
+      description: >
+        Se l'URL punta a uno zip: il percorso del file .lean dentro lo zip.
+        Lascia vuoto se l'URL è già un .lean diretto.
+      placeholder: "test/mathd_numbertheory_229.lean"
+    validations:
+      required: false
+
+  - type: input
+    id: prova_sha256
+    attributes:
+      label: prova_sha256
+      description: >
+        Facoltativo: sha256 (64 cifre hex minuscole) del file .lean che ti aspetti.
+        Se indicato e diverso da quello scaricato, il giudizio dice NON PARTE.
+        Utile per fissare la prova su cui vuoi il verdetto.
+      placeholder: "64 cifre hex minuscole (facoltativo)"
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        **Nota sulla sicurezza:** la prova gira solo dentro bubblewrap (sandbox senza rete).
+        Chiunque abbia un account GitHub può aprire questa issue; ogni corsa consuma minuti
+        Actions del repo pubblico. Il verdetto compare come commento su questa issue.

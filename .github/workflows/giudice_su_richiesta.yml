@@ -1,0 +1,501 @@
+# giudice_su_richiesta.yml — variante «su richiesta» del giudice pubblico (DIADE).
+# Innesco: issue con etichetta «giudizio» o titolo che comincia con «[giudizio]».
+# I parametri si leggono dal corpo della issue via env CORPO (mai interpolati in run:).
+# Un passo di parsing con regex strette valida i campi prima di scaricare qualsiasi cosa.
+# Se un campo non passa: commento «NON PARTE (richiesta malformata: <campo>)» e fine.
+# Il corpo dei lavori «enunciato», «prova», «giudizio» è identico alla base (_base_main.yml).
+name: giudice-su-richiesta
+
+on:
+  issues:
+    types: [opened, edited]
+
+# Filtra: solo issue con etichetta «giudizio» OPPURE titolo che comincia con «[giudizio]»
+# (il filtro reale è nel passo «valida»; questo blocco non può fare regex sul titolo)
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: giudizio
+  cancel-in-progress: false
+
+env:
+  # Costanti del comparator (identiche alla base)
+  PRIMA: "Quot Quot.mk Quot.lift Quot.ind"
+  DOPO: >-
+    propext Quot.sound Classical.choice Nat.add Nat.sub Nat.mul Nat.pow Nat.gcd Nat.div Nat.mod Nat.beq Nat.ble
+    Nat.land Nat.lor Nat.xor Nat.shiftLeft Nat.shiftRight String.ofList Char.ofNat List eagerReduce Nat String
+    String.mk Char optParam autoParam semiOutParam outParam
+  # Il file-prova lo scrive il passo «scarica» del lavoro prova; non sta nel repo
+  P: prova_altrui.lean
+
+jobs:
+
+  # ── PARSING E VALIDAZIONE ───────────────────────────────────────────────────
+  valida:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Gira solo se l'issue ha l'etichetta «giudizio» O il titolo comincia con «[giudizio]»
+    if: |
+      contains(github.event.issue.labels.*.name, 'giudizio') ||
+      startsWith(github.event.issue.title, '[giudizio]')
+    outputs:
+      enunciato:   ${{ steps.parsing.outputs.enunciato }}
+      bersaglio:   ${{ steps.parsing.outputs.bersaglio }}
+      prova_url:   ${{ steps.parsing.outputs.prova_url }}
+      prova_membro: ${{ steps.parsing.outputs.prova_membro }}
+      prova_sha256: ${{ steps.parsing.outputs.prova_sha256 }}
+      ok:          ${{ steps.tetto.outputs.raggiunto == '1' && '0' || steps.parsing.outputs.ok }}
+    steps:
+      - name: tetto 20 corse in 24 h (prima di scaricare qualsiasi cosa)
+        id: tetto
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          DT=$(date -u -d '24 hours ago' '+%Y-%m-%dT%H:%M:%SZ')
+          n=$(gh api -X GET "repos/${REPO}/actions/workflows/giudice_su_richiesta.yml/runs" -f "created=>=${DT}" -f per_page=100 --jq '.total_count')
+          if [ "$n" -ge 20 ]; then
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO" \
+              --body "NON PARTE (tetto raggiunto: 20 corse in 24 h)"
+            echo "raggiunto=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "raggiunto=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.tetto.outputs.raggiunto != '1'
+        with:
+          persist-credentials: false
+
+      - name: parsing e validazione del corpo della issue (solo via env CORPO)
+        id: parsing
+        if: steps.tetto.outputs.raggiunto != '1'
+        env:
+          CORPO: ${{ github.event.issue.body }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 -I - <<'PYEOF'
+          import re, os, subprocess, sys
+
+          corpo = os.environ["CORPO"]
+          issue = os.environ["ISSUE_NUMBER"]
+          repo  = os.environ["REPO"]
+          run_url = os.environ["RUN_URL"]
+
+          def campo(nome, testo):
+              """Estrae il valore dal corpo: riga «nome: valore», oppure la forma che
+              l'issue form di GitHub produce: «### nome» seguito dal valore sulla prima
+              riga non vuota. «_No response_» (campo facoltativo lasciato vuoto nel form)
+              vale come assente."""
+              m = re.search(r'(?im)^\s*' + re.escape(nome) + r'\s*:\s*(.+)$', testo)
+              if not m:
+                  m = re.search(r'(?im)^\s*#{1,6}\s*' + re.escape(nome) + r'\s*\n\s*\n?\s*([^\n]+)$', testo)
+              v = m.group(1).strip() if m else ""
+              return "" if v == "_No response_" else v
+
+          def commenta_e_ferma(motivo):
+              msg = f"NON PARTE (richiesta malformata: {motivo})\n\nCorsa: {run_url}"
+              subprocess.run(
+                  ["gh", "issue", "comment", issue, "--repo", repo, "--body", msg],
+                  check=True, env={**os.environ}
+              )
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("ok=0\n")
+              sys.exit(0)
+
+          enunciato    = campo("enunciato", corpo)
+          prova_url    = campo("prova_url", corpo)
+          prova_membro = campo("prova_membro", corpo)
+          prova_sha256 = campo("prova_sha256", corpo)
+          bersaglio    = campo("bersaglio", corpo)
+
+          # Regex strette
+          RE_ENUNCIATO = re.compile(r'^[A-Za-z0-9_.-]+\.lean$')
+          RE_URL       = re.compile(
+              r'^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'
+              r'/raw/[0-9a-f]{40}/[A-Za-z0-9_./-]+\.(zip|lean)$'
+          )
+          RE_MEMBRO    = re.compile(r'^[A-Za-z0-9_./-]+\.lean$')
+          RE_SHA256    = re.compile(r'^[0-9a-f]{64}$')
+          RE_BERSAGLIO = re.compile(r'^[A-Za-z0-9_.]+$')
+
+          if not enunciato:
+              commenta_e_ferma("campo 'enunciato' assente")
+          if not RE_ENUNCIATO.match(enunciato):
+              commenta_e_ferma(f"enunciato non valido (atteso: ^[A-Za-z0-9_.-]+\\.lean$): '{enunciato}'")
+          # Verifica che il file esista nel repo
+          import pathlib
+          if not pathlib.Path(f"enunciati/{enunciato}").exists():
+              commenta_e_ferma(f"enunciato 'enunciati/{enunciato}' non esiste nel repo")
+
+          if not prova_url:
+              commenta_e_ferma("campo 'prova_url' assente")
+          if not RE_URL.match(prova_url):
+              commenta_e_ferma(
+                  f"prova_url non valido (atteso: https://github.com/<utente>/<repo>/raw/<sha40>/<percorso>.(zip|lean)): '{prova_url}'"
+              )
+
+          if prova_membro:
+              if not RE_MEMBRO.match(prova_membro):
+                  commenta_e_ferma(f"prova_membro non valido (atteso: ^[A-Za-z0-9_./-]+\\.lean$ senza '..'): '{prova_membro}'")
+              if ".." in prova_membro:
+                  commenta_e_ferma(f"prova_membro contiene '..': '{prova_membro}'")
+
+          if prova_sha256 and not RE_SHA256.match(prova_sha256):
+              commenta_e_ferma(f"prova_sha256 non valido (atteso: 64 cifre hex minuscole): '{prova_sha256}'")
+
+          if not bersaglio:
+              commenta_e_ferma("campo 'bersaglio' assente")
+          if not RE_BERSAGLIO.match(bersaglio):
+              commenta_e_ferma(f"bersaglio non valido: '{bersaglio}'")
+
+          # Tutto ok: scrivi gli output
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a") as f:
+              f.write(f"enunciato=enunciati/{enunciato}\n")
+              f.write(f"bersaglio={bersaglio}\n")
+              f.write(f"prova_url={prova_url}\n")
+              f.write(f"prova_membro={prova_membro}\n")
+              f.write(f"prova_sha256={prova_sha256}\n")
+              f.write("ok=1\n")
+          print(f"Parsing OK: enunciato=enunciati/{enunciato} bersaglio={bersaglio}")
+          PYEOF
+
+  # ── LAVORO ENUNCIATO ────────────────────────────────────────────────────────
+  enunciato:
+    needs: valida
+    if: needs.valida.outputs.ok == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      E: ${{ needs.valida.outputs.enunciato }}
+      B: ${{ needs.valida.outputs.bersaglio }}
+    outputs:
+      sha: ${{ steps.esporta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: elan, Mathlib dagli olean, lean4export (v4.33.1)
+        run: bash .github/prepara.sh
+      - name: costruisce ed esporta l'enunciato (nessuna prova esiste su questa macchina)
+        id: esporta
+        run: |
+          mkdir -p Giudizio && cp "$E" Giudizio/Challenge.lean
+          lake build Giudizio.Challenge
+          lake env "$RUNNER_TEMP/lean4export-bin" Giudizio.Challenge -- $PRIMA "$B" $DOPO > challenge.ndjson
+          s=$(sha256sum challenge.ndjson | cut -d' ' -f1)
+          echo "SHA_EXPORT_ENUNCIATO: $s ($(wc -c < challenge.ndjson) byte) · sorgente $(sha256sum "$E" | cut -d' ' -f1)"
+          echo "sha=$s" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: enunciato
+          path: challenge.ndjson
+
+  # ── LAVORO PROVA ────────────────────────────────────────────────────────────
+  prova:
+    needs: valida
+    if: needs.valida.outputs.ok == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      E: ${{ needs.valida.outputs.enunciato }}
+      B: ${{ needs.valida.outputs.bersaglio }}
+    outputs:
+      fonte:     ${{ steps.scarica.outputs.fonte }}
+      sha_prova: ${{ steps.scarica.outputs.sha_prova }}
+      ferma:     ${{ steps.scarica.outputs.ferma }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: elan, Mathlib dagli olean, lean4export (v4.33.1)
+        run: bash .github/prepara.sh
+      - name: la sandbox e la cartella fidata, prima che un byte della prova giri
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap >/dev/null
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          F="$RUNNER_TEMP/fidato"; mkdir -p "$F"
+          cp .github/pulisci.py .github/sandbox.sh "$F/"
+          cp "$RUNNER_TEMP/lean4export-bin" "$F/lean4export"
+          bash "$F/sandbox.sh" lake --version
+          bash "$F/sandbox.sh" sh -c 'sudo -n true' && { echo "la sandbox lascia sudo: non parto"; exit 1; }
+          echo "SANDBOX_PROVA: bwrap"
+      - name: scarica la prova altrui (passo fidato; il file ottenuto è dati, non viene eseguito qui)
+        id: scarica
+        env:
+          U: ${{ needs.valida.outputs.prova_url }}
+          M: ${{ needs.valida.outputs.prova_membro }}
+          SHA_ATTESO: ${{ needs.valida.outputs.prova_sha256 }}
+        run: |
+          F="$RUNNER_TEMP/fidato"
+          case "$U" in http://*|https://*) ;; *) echo "prova_url non è un URL http(s)"; exit 2;; esac
+          case "$U$M$SHA_ATTESO" in *[[:space:][:cntrl:]]*) echo "input con spazi o caratteri di controllo"; exit 2;; esac
+          case "$M" in -*) echo "prova_membro non può cominciare con -"; exit 2;; esac
+          D="$RUNNER_TEMP/altrui"; mkdir "$D"
+          curl -sSfL --max-filesize 50000000 -o "$D/scaricato" -- "$U"
+          if [ -n "$M" ]; then unzip -p "$D/scaricato" "$M" > "$D/prova.lean"; else cp "$D/scaricato" "$D/prova.lean"; fi
+          test -s "$D/prova.lean" || { echo "il file .lean ottenuto è vuoto"; exit 2; }
+          s=$(sha256sum "$D/prova.lean" | cut -d' ' -f1)
+          echo "FONTE: $U${M:+ ($M)}"
+          echo "SHA_PROVA: $s ($(wc -c < "$D/prova.lean") byte)"
+          tok=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+          echo "== le prime righe del file ottenuto (non fidato: caratteri di controllo resi visibili, righe rientrate)"
+          echo "::stop-commands::$tok"
+          head -c 600 "$D/prova.lean" | python3 "$F/pulisci.py" +600
+          echo "::$tok::"
+          echo "fonte=$U${M:+ ($M)}" >> "$GITHUB_OUTPUT"
+          echo "sha_prova=$s" >> "$GITHUB_OUTPUT"
+          if [ -n "$SHA_ATTESO" ] && [ "$(printf %s "$SHA_ATTESO" | tr 'A-F' 'a-f')" != "$s" ]; then
+            echo "SHA_PROVA_ATTESO: $SHA_ATTESO · diverso da quello ottenuto: la prova non gira"
+            echo "ferma=1" >> "$GITHUB_OUTPUT"
+            : > "$F/solution.ndjson"; echo "FERMA: sha della prova diverso da prova_sha256" > "$F/filtro_esito.txt"; : > "$F/filtro_tempo.txt"
+          else
+            echo "ferma=0" >> "$GITHUB_OUTPUT"
+            cp "$D/prova.lean" "$P"
+          fi
+      - name: il filtro di casa (il file + `#print axioms`) nella sandbox; tempo e memoria misurati da fuori
+        if: steps.scarica.outputs.ferma == '0'
+        run: |
+          F="$RUNNER_TEMP/fidato"
+          { cat "$P"; printf '\n\n#print axioms %s\n' "$B"; } > filtro.lean
+          set +e
+          /usr/bin/time -v -o "$F/filtro_tempo.txt" bash "$F/sandbox.sh" lake env lean filtro.lean > "$F/filtro_uscita.txt" 2>&1; rc=$?
+          set -e
+          tok=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+          echo "== ciò che la prova ha stampato (non fidato: caratteri di controllo resi visibili, righe rientrate)"
+          echo "::stop-commands::$tok"
+          python3 "$F/pulisci.py" +20000 < "$F/filtro_uscita.txt"
+          echo "::$tok::"
+          python3 - "$rc" "$B" "$F" <<'PY' | tee "$F/filtro_esito.txt"
+          import re, sys
+          rc, b, F = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+          out, t = open(F + "/filtro_uscita.txt", errors="replace").read(), open(F + "/filtro_tempo.txt").read()
+          m = re.search(r"Maximum resident set size \(kbytes\): (\d+)", t)
+          gib = int(m.group(1)) / 1024 / 1024 if m else -1
+          s = 0.0
+          el = re.search(r"Elapsed \(wall clock\) time .*?: ([\d:.]+)", t)
+          for x in (el.group(1).split(":") if el else []):
+              s = s * 60 + float(x)
+          OK = {"propext", "Classical.choice", "Quot.sound"}
+          ass = re.findall("'" + re.escape(b) + r"' depends on axioms: \[(.*?)\]", out, re.S)
+          if [l for l in out.splitlines() if re.search(r":\d+:\d+: error", l)]:
+              k = "RIFIUTA (errore)"
+          elif rc != 0:
+              k = f"NON DECIDE (lean rc={rc} senza righe di errore)"
+          elif ass:
+              ax = {x.strip() for x in ass[-1].replace("\n", " ").split(",")}
+              fuori = sorted(re.sub(r"[^\w.'«»]", "?", a) for a in ax - OK)
+              k = "ACCETTA" if ax <= OK else "RIFIUTA (assiomi fuori: " + ", ".join(fuori) + ")"
+          elif f"'{b}' does not depend on any axioms" in out:
+              k = "ACCETTA"
+          else:
+              k = "RIFIUTA (#print axioms del bersaglio non ha risposto)"
+          print(f"FILTRO: {k}")
+          print(f"FILTRO_SECONDI: {s:.1f} · FILTRO_MEMORIA_GIB: {gib:.2f} · LEAN_RC: {rc}")
+          PY
+      - name: costruisce ed esporta la prova (nella sandbox)
+        if: steps.scarica.outputs.ferma == '0'
+        run: |
+          F="$RUNNER_TEMP/fidato"
+          mkdir -p Giudizio && cp "$P" Giudizio/Solution.lean
+          set +e
+          bash "$F/sandbox.sh" lake build Giudizio.Solution > "$F/build.txt" 2>&1; brc=$?
+          erc=-1
+          if [ $brc -eq 0 ]; then
+            bash "$F/sandbox.sh" lake env /opt/lean4export Giudizio.Solution -- $PRIMA "$B" $DOPO > "$F/solution.ndjson" 2> "$F/export_err.txt"; erc=$?
+          fi
+          set -e
+          tok=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+          echo "== la build (non fidata: caratteri di controllo resi visibili, righe rientrate)"
+          echo "::stop-commands::$tok"
+          python3 "$F/pulisci.py" -4000 < "$F/build.txt"
+          [ -s "$F/export_err.txt" ] && python3 "$F/pulisci.py" -2000 < "$F/export_err.txt"
+          echo "::$tok::"
+          echo "BUILD_RC: $brc · EXPORT_RC: $erc" | tee -a "$F/filtro_esito.txt"
+          if [ $brc -ge 128 ] || [ $erc -ge 128 ]; then
+            echo "PROVA_GUASTO: build o export uccisi da un segnale (rc $brc / $erc): non è un rifiuto" | tee -a "$F/filtro_esito.txt"
+          fi
+          if [ $brc -ne 0 ] || [ $erc -ne 0 ]; then : > "$F/solution.ndjson"; fi
+          touch "$F/solution.ndjson"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prova
+          path: |
+            ${{ runner.temp }}/fidato/solution.ndjson
+            ${{ runner.temp }}/fidato/filtro_esito.txt
+            ${{ runner.temp }}/fidato/filtro_tempo.txt
+
+  # ── LAVORO GIUDIZIO ─────────────────────────────────────────────────────────
+  giudizio:
+    needs: [valida, enunciato, prova]
+    if: needs.valida.outputs.ok == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      E: ${{ needs.valida.outputs.enunciato }}
+      B: ${{ needs.valida.outputs.bersaglio }}
+    outputs:
+      verdetto: ${{ steps.giudizio.outputs.verdetto }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: sorgenti
+      - uses: actions/download-artifact@v4
+        with:
+          name: enunciato
+          path: dati/enunciato
+      - uses: actions/download-artifact@v4
+        with:
+          name: prova
+          path: dati/prova
+      - name: la toolchain v4.35.0-rc4 (lake comparator e i kernel) e bubblewrap per la sandbox
+        run: |
+          curl -sSfL https://github.com/leanprover/elan/releases/latest/download/elan-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          ./elan-init -y --default-toolchain none >/dev/null
+          "$HOME/.elan/bin/elan" toolchain install leanprover/lean4:v4.35.0-rc4
+          L="$HOME/.elan/toolchains/leanprover--lean4---v4.35.0-rc4/bin"
+          ls "$L"
+          for k in lake leanchecker-paranoid nanoda_bin con-leche con-ron; do test -x "$L/$k" || { echo "manca $k"; exit 2; }; done
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap >/dev/null
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: giudizio
+        id: giudizio
+        env:
+          FONTE:     ${{ needs.prova.outputs.fonte }}
+          SHA_PROVA: ${{ needs.prova.outputs.sha_prova }}
+          FERMA:     ${{ needs.prova.outputs.ferma }}
+        run: |
+          bash sorgenti/.github/ingresso.sh
+          L="$HOME/.elan/toolchains/leanprover--lean4---v4.35.0-rc4/bin"
+          F="$RUNNER_TEMP/fidato"; mkdir -p "$F"; cp sorgenti/.github/pulisci.py "$F/"
+          C="$PWD/dati/enunciato/challenge.ndjson"; S="$PWD/dati/prova/solution.ndjson"
+          sc=$(sha256sum "$C" | cut -d' ' -f1)
+          se=$(sha256sum "sorgenti/$E" | cut -d' ' -f1); sp="$SHA_PROVA"
+          mathlib_sha=$(cat sorgenti/.github/mathlib_sha 2>/dev/null || echo "n/d")
+          tok=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+          esito() {
+            echo "verdetto=$1" >> "$GITHUB_OUTPUT"
+            { echo "## VERDETTO_G0: $1"
+              echo
+              echo "Scritto dal passo fidato del lavoro \`giudizio\`, che non esegue niente della prova."
+              echo
+              echo "| | |"
+              echo "|---|---|"
+              echo "| enunciato | \`$E\` · sha256 \`$se\` |"
+              echo "| prova (di un altro, scaricata in corsa) | \`$FONTE\` · sha256 \`$sp\` |"
+              echo "| bersaglio | \`$B\` |"
+              echo "| export dell'enunciato | sha256 \`$sc\` |"
+              echo "| commit del giudice | \`$GITHUB_SHA\` |"
+              echo "| Mathlib del giudice | \`$mathlib_sha\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "VERDETTO_G0: $1"
+          }
+          echo "SHA_ENUNCIATO_SORGENTE: $se ($E)"
+          echo "FONTE: $FONTE"
+          echo "SHA_PROVA: $sp"
+          echo "SHA_EXPORT_ENUNCIATO: $sc (dal lavoro enunciato: ${{ needs.enunciato.outputs.sha }})"
+          echo "== dal lavoro prova (scritto dal suo passo fidato; i nomi che contiene vengono dalla prova):"
+          echo "::stop-commands::$tok"
+          python3 "$F/pulisci.py" < dati/prova/filtro_esito.txt
+          echo "::$tok::"
+          mkdir giudice && cd giudice
+          python3 - "$B" "$L" <<'PY'
+          import json, sys
+          b, L = sys.argv[1], sys.argv[2]
+          json.dump({"challenge_module": "Challenge", "solution_module": "Solution", "theorem_names": [b],
+                     "permitted_axioms": ["propext", "Quot.sound", "Classical.choice"],
+                     "external_kernels": {"Lean paranoid": [L + "/leanchecker-paranoid", "--silent", "--from-export"],
+                                          "nanoda": [L + "/nanoda_bin"], "con-leche": [L + "/con-leche"],
+                                          "con-ron": [L + "/con-ron"]}}, open("comparator.json", "w"))
+          PY
+          if [ "$FERMA" = "1" ]; then
+            esito "NON PARTE (lo sha256 della prova ottenuta non è prova_sha256: la prova non è stata eseguita)"; exit 1
+          fi
+          if [ "$sc" != "${{ needs.enunciato.outputs.sha }}" ]; then
+            esito "NON PARTE (l'export dell'enunciato non è quello che il lavoro enunciato ha dato)"; exit 1
+          fi
+          if [ ! -s "$S" ] && grep -q "^PROVA_GUASTO:" ../dati/prova/filtro_esito.txt; then
+            esito "NON DECIDE (la build o l'export della prova sono stati uccisi: vedi il lavoro prova)"; exit 0
+          fi
+          if [ ! -s "$S" ]; then
+            esito "RIFIUTA (la prova non si costruisce o non si esporta: vedi il lavoro prova)"; exit 0
+          fi
+          export PATH="$L:/usr/bin:/bin:/usr/sbin:/sbin"
+          set +e
+          lake comparator --config comparator.json --challenge-from-export "$C" --solution-from-export "$S" > uscita.txt 2>&1; rc=$?
+          set -e
+          echo "== il comparator (i nomi e i messaggi sui dati della prova non sono fidati: resi visibili, righe rientrate)"
+          echo "::stop-commands::$tok"
+          python3 "$F/pulisci.py" -20000 < uscita.txt
+          echo "::$tok::"
+          if [ $rc -eq 0 ] && grep -q "Your solution is okay!" uscita.txt; then v=ACCETTA
+          elif [ $rc -ne 1 ] && grep -qiE "bwrap|bubblewrap|sandbox|namespace" uscita.txt; then
+            v="NON PARTE (la sandbox del comparator non parte su questa VM: senza sandbox non giudico)"
+          elif [ $rc -eq 1 ] && grep -qE "do not match|Illegal axiom|rejected" uscita.txt; then v=RIFIUTA
+          elif [ $rc -eq 1 ]; then v="NON DECIDE (exit 1 senza un rifiuto riconosciuto: un kernel caduto non è un rifiuto)"
+          else v="NON PARTE (exit $rc)"; fi
+          echo "SANDBOX: bwrap"
+          esito "$v"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verdetto
+          path: giudice/
+
+  # ── COMMENTO FINALE SULLA ISSUE ─────────────────────────────────────────────
+  commenta:
+    needs: [valida, enunciato, prova, giudizio]
+    if: always() && needs.valida.outputs.ok == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: commenta il risultato sulla issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          VERDETTO:  ${{ needs.giudizio.outputs.verdetto }}
+          FONTE:     ${{ needs.prova.outputs.fonte }}
+          SHA_PROVA: ${{ needs.prova.outputs.sha_prova }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ENUNCIATO: ${{ needs.valida.outputs.enunciato }}
+          BERSAGLIO: ${{ needs.valida.outputs.bersaglio }}
+        run: |
+          python3 -I - <<'PYEOF'
+          import os, subprocess
+
+          verdetto  = os.environ.get("VERDETTO", "(nessun verdetto: il lavoro giudizio non è terminato)")
+          fonte     = os.environ.get("FONTE", "n/d")
+          sha_prova = os.environ.get("SHA_PROVA", "n/d")
+          run_url   = os.environ["RUN_URL"]
+          issue     = os.environ["ISSUE_NUMBER"]
+          repo      = os.environ["REPO"]
+
+          corpo = f"""**VERDETTO_G0: {verdetto}**
+
+          | | |
+          |---|---|
+          | FONTE | `{fonte}` |
+          | SHA_PROVA | `{sha_prova}` |
+          | Corsa | {run_url} |
+
+          Mathlib del giudice: vedi il log del lavoro `enunciato` (riga `SHA_EXPORT_ENUNCIATO`).
+
+          _La prova è girata in sandbox (bubblewrap, senza rete, senza credenziali). Il verdetto è pubblico._
+          """
+
+          subprocess.run(
+              ["gh", "issue", "comment", issue, "--repo", repo, "--body", corpo],
+              check=True, env={**os.environ}
+          )
+          PYEOF
