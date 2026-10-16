@@ -325,6 +325,16 @@ jobs:
           fi
           if [ $brc -ne 0 ] || [ $erc -ne 0 ]; then : > "$F/solution.ndjson"; fi
           touch "$F/solution.ndjson"
+      - name: controllo FUORI dalla sandbox — la prova non ha lasciato file sul runner (condizione 4, collaudo C4; Largo g1473)
+        if: always()
+        run: |
+          # Gira nel runner, non in bubblewrap: se la sandbox tiene, ciò che la prova ha scritto in /tmp o in $HOME
+          # è rimasto nel suo tmpfs. Un file presente qui è la sandbox bucata: la corsa si ferma senza verdetto.
+          set +e; r=0
+          for f in /tmp/fuga_diade "$HOME/fuga_diade"; do
+            if [ -e "$f" ]; then echo "FUGA_CONTROLLO: $f PRESENTE"; r=1; else echo "FUGA_CONTROLLO: $f assente"; fi
+          done
+          [ $r -eq 0 ] || { echo "SANDBOX_BUCATA: una prova ha scritto fuori da bubblewrap; nessun verdetto"; exit 1; }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
